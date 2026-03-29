@@ -6,7 +6,7 @@
 - 支持触发关键词前缀自定义（如 `/`、`!`、`漫画`）。
 - 支持群聊与用户白名单控制。
 - 支持漫画搜索（关键词或番号）。
-- 支持漫画下载（番号或链接），并自动：图片 -> PDF -> 改名为 TXT 后缀 -> 加密 ZIP。
+- 支持漫画下载（番号或链接），并自动：图片 -> PDF -> 改名为 EXE 后缀 -> 加密 ZIP。
 - 完成后将 ZIP 文件回传到触发聊天窗口。
 - 全流程状态提示与异常友好提示。
 
@@ -15,6 +15,11 @@
 ```text
 qq_code_listener/
   ├─ main.py
+  ├─ plugin_types.py
+  ├─ services/
+  │   ├─ manga_service.py
+  │   ├─ package_service.py
+  │   └─ send_service.py
   ├─ metadata.yaml
   ├─ _conf_schema.json
   ├─ requirements.txt
@@ -77,7 +82,7 @@ pip install -r requirements.txt
 - 正在查询
 - 正在下载
 - 正在生成 PDF
-- 正在转换 TXT 后缀
+- 正在转换 EXE 后缀
 - 正在加密压缩 ZIP
 - 正在发送
 - 发送完成
@@ -96,5 +101,6 @@ pip install -r requirements.txt
 
 - 请确保运行环境可访问 jmcomic 对应站点。
 - 白名单建议优先配置，避免功能被非目标群组滥用。
-- 不同 AstrBot/适配器版本文件发送接口命名可能不同，本插件已做多接口兼容尝试。
+- 文件发送仅使用“消息链文件组件（MessageEventResult + File）”路径，代码更简洁。
+- ZIP 包内文件后缀为 `.exe`，实际内容为由图片合成的 PDF，仅用于规避部分平台后缀限制。
 - 下载的临时图片会在任务结束后自动清理。
