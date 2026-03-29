@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import re
 import shutil
 from pathlib import Path
@@ -31,14 +32,20 @@ DEFAULT_CONFIG = {
     "search_result_limit": 3,
     "zip_level": 9,
     "zip_password": "123456",
+    "default_max_page": 200,
+    "retry_per_chapter": 3,
+    "admin_user_ids": [],
 }
+
+STATE_OPEN_KEY = "qq_code_listener_open"
+STATE_MAX_PAGE_KEY = "qq_code_listener_max_page"
 
 
 @register(
     "qq_code_listener",
     "wzh",
     "禁漫查询下载（白名单+关键词触发）",
-    "2.1.0",
+    "2.2.0",
 )
 class QQCodeListenerPlugin(Star):
     def __init__(
@@ -72,13 +79,26 @@ class QQCodeListenerPlugin(Star):
         if command_text is None:
             return
 
+        # 管理命令
+        admin_handled = await self._try_handle_admin_command(event, command_text)
+        if admin_handled is not None:
+            yield event.plain_result(admin_handled)
+            return
+
+        if not await self._is_feature_open():
+            return
+
         parsed = self._parse_command(command_text)
         if parsed is None:
             help_text = (
                 "指令格式:\n"
-                "1) /漫画 搜索 关键词\n"
-                "2) /漫画 下载 番号或链接\n"
-                "关键词前缀可在插件配置 trigger_keywords 中自定义。"
+                "1) /jmcomic 422866\n"
+                "2) /jmcomic 422866 p123456\n"
+                "3) /jmcomic 搜索 关键词\n"
+                "管理员:\n"
+                "- /jmcomic set maxpage 200\n"
+                "- /jmcomic open|close\n"
+                "兼容旧格式: /漫画 下载 422866"
             )
             yield event.plain_result(help_text)
             return
@@ -95,10 +115,21 @@ class QQCodeListenerPlugin(Star):
 
         task_dir: Path | None = None
         try:
-            album = await asyncio.to_thread(self.manga_service.search_album, payload)
+            album_id = payload.get("album_id")
+            chapter_id = payload.get("chapter_id")
+            max_page = await self._get_max_page()
+            retry_per_chapter = int(self.config.get("retry_per_chapter", 3) or 3)
+
+            album = await asyncio.to_thread(self.manga_service.search_album, album_id)
             yield event.plain_result(f"已定位漫画：{album.title}（ID: {album.album_id}），正在下载图片...")
 
-            task_dir, image_files = await asyncio.to_thread(self.manga_service.download_images, album.album_id)
+            task_dir, image_files = await asyncio.to_thread(
+                self.manga_service.download_images,
+                album.album_id,
+                chapter_id,
+                retry_per_chapter,
+                max_page,
+            )
             if not image_files:
                 raise RuntimeError("下载完成但未找到任何图片文件")
 
@@ -146,7 +177,7 @@ class QQCodeListenerPlugin(Star):
                 return body
         return None
 
-    def _parse_command(self, command_text: str) -> tuple[str, str] | None:
+    def _parse_command(self, command_text: str) -> tuple[str, str | dict[str, str | None]] | None:
         if not command_text:
             return None
 
@@ -161,11 +192,39 @@ class QQCodeListenerPlugin(Star):
         for pattern, action in patterns:
             match = re.match(pattern, text, flags=re.IGNORECASE)
             if match:
-                return action, match.group(2).strip()
+                payload_text = match.group(2).strip()
+                if action == "search":
+                    return "search", payload_text
+                return "download", self._parse_download_payload(payload_text)
+
+        # 兼容: jmcomic 123 p456
+        jm_match = re.match(r"^jmcomic\s+(.+)$", text, flags=re.IGNORECASE)
+        if jm_match:
+            payload_text = jm_match.group(1).strip()
+            payload = self._parse_download_payload(payload_text)
+            if payload.get("album_id"):
+                return "download", payload
+
+        # 兼容: 唤醒词 + 纯数字
+        number_match = re.match(r"^(\d+)(?:\s+p?(\d+))?$", text, flags=re.IGNORECASE)
+        if number_match:
+            payload = {
+                "album_id": number_match.group(1),
+                "chapter_id": number_match.group(2),
+            }
+            return "download", payload
 
         if self.manga_service.extract_album_id(text):
-            return "download", text
+            return "download", self._parse_download_payload(text)
         return None
+
+    def _parse_download_payload(self, text: str) -> dict[str, str | None]:
+        album_id = self.manga_service.extract_album_id(text)
+        chapter_id = self.manga_service.extract_chapter_id(text)
+        return {
+            "album_id": album_id,
+            "chapter_id": chapter_id,
+        }
 
     def _allowed_event(self, event: AstrMessageEvent) -> bool:
         group_id = self._get_first_attr(
@@ -203,6 +262,87 @@ class QQCodeListenerPlugin(Star):
         if isinstance(value, list):
             return [str(item).strip() for item in value if str(item).strip()]
         return []
+
+    async def _try_handle_admin_command(self, event: AstrMessageEvent, command_text: str) -> str | None:
+        text = command_text.strip().lstrip("/")
+
+        # 支持 /jmcomic set maxpage x 或 /set maxpage x
+        set_match = re.match(r"^(?:jmcomic\s+)?set\s+maxpage\s+(\d+)$", text, flags=re.IGNORECASE)
+        if set_match:
+            if not self._is_admin(event):
+                return "无权限：仅管理员可设置最大页数。"
+            value = max(1, int(set_match.group(1)))
+            await self._set_kv(STATE_MAX_PAGE_KEY, value)
+            return f"已设置最大下载页数为 {value}"
+
+        # 支持 /jmcomic open|close，兼容多斜杠写法
+        open_close_match = re.match(r"^jmcomic\s+(open|close)$", text, flags=re.IGNORECASE)
+        if open_close_match:
+            if not self._is_admin(event):
+                return "无权限：仅管理员可开关功能。"
+            action = open_close_match.group(1).lower()
+            open_state = action == "open"
+            await self._set_kv(STATE_OPEN_KEY, open_state)
+            return "jmcomic 功能已开启" if open_state else "jmcomic 功能已关闭"
+
+        return None
+
+    def _is_admin(self, event: AstrMessageEvent) -> bool:
+        sender_id = self._extract_sender_id(event)
+        admins = set(self._to_string_list(self.config.get("admin_user_ids", [])))
+        return bool(sender_id) and str(sender_id) in admins
+
+    def _extract_sender_id(self, event: AstrMessageEvent) -> str:
+        for name in ["get_sender_id"]:
+            method = getattr(event, name, None)
+            if callable(method):
+                try:
+                    value = method()
+                    if value is not None and str(value).strip() != "":
+                        return str(value)
+                except Exception:
+                    pass
+
+        uid = self._get_first_attr(
+            event,
+            ["user_id", "userid", "sender_id", "from_user_id", "author_id"],
+        )
+        return "" if uid is None else str(uid)
+
+    async def _is_feature_open(self) -> bool:
+        value = await self._get_kv(STATE_OPEN_KEY, True)
+        return bool(value)
+
+    async def _get_max_page(self) -> int:
+        default_value = int(self.config.get("default_max_page", 200) or 200)
+        value = await self._get_kv(STATE_MAX_PAGE_KEY, default_value)
+        try:
+            return max(1, int(value))
+        except Exception:
+            return default_value
+
+    async def _get_kv(self, key: str, default: Any) -> Any:
+        getter = getattr(self, "get_kv_data", None)
+        if not callable(getter):
+            return default
+        try:
+            value = getter(key)
+            if inspect.isawaitable(value):
+                value = await value
+            return default if value is None else value
+        except Exception:
+            return default
+
+    async def _set_kv(self, key: str, value: Any) -> None:
+        setter = getattr(self, "put_kv_data", None)
+        if not callable(setter):
+            return
+        try:
+            result = setter(key, value)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.warning(f"[qq_code_listener] 写入 KV 失败: key={key}")
 
     @staticmethod
     def _friendly_error(exc: Exception) -> str:

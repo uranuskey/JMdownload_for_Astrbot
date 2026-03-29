@@ -54,7 +54,13 @@ class MangaService:
         album = self._get_album_detail(client, candidate_ids[0])
         return self._normalize_album(album)
 
-    def download_images(self, album_id: str) -> tuple[Path, list[Path]]:
+    def download_images(
+        self,
+        album_id: str,
+        chapter_id: str | None = None,
+        retry_per_chapter: int = 3,
+        max_pages: int | None = None,
+    ) -> tuple[Path, list[Path]]:
         task_dir = self._build_base_dir() / f"task_{album_id}_{uuid.uuid4().hex[:8]}"
         task_dir.mkdir(parents=True, exist_ok=True)
 
@@ -62,15 +68,26 @@ class MangaService:
         if not hasattr(jmcomic, "download_album"):
             raise RuntimeError("当前 jmcomic 版本缺少 download_album 方法")
 
-        # 优先按章节逐个下载，减少部分大本子下载不全的概率。
+        # 优先按章节逐个下载，支持重试与断点续下。
         downloaded = False
         try:
             client = option.new_jm_client()
             album = self._get_album_detail(client, album_id)
             photo_ids = self._extract_photo_ids(album)
+            if chapter_id:
+                chapter_id = str(chapter_id)
+                photo_ids = [pid for pid in photo_ids if str(pid) == chapter_id]
+                if not photo_ids:
+                    raise RuntimeError(f"未找到章节 {chapter_id}")
+
             if photo_ids and hasattr(jmcomic, "download_photo"):
                 for photo_id in photo_ids:
-                    jmcomic.download_photo(photo_id, option)
+                    self._download_photo_with_retry(
+                        photo_id=str(photo_id),
+                        option=option,
+                        task_dir=task_dir,
+                        max_retry=max(1, int(retry_per_chapter or 1)),
+                    )
                 downloaded = True
         except Exception as exc:
             logger.warning(f"[qq_code_listener] 逐章节下载失败，回退整本下载: {exc}")
@@ -85,12 +102,24 @@ class MangaService:
                 if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
             ]
         )
+
+        if max_pages is not None and max_pages > 0 and len(image_files) > max_pages:
+            image_files = image_files[:max_pages]
+
         logger.info(f"[qq_code_listener] album={album_id} 下载图片数量: {len(image_files)}")
         return task_dir, image_files
 
     @staticmethod
     def extract_album_id(text: str) -> str | None:
-        match = re.search(r"(\d{5,10})", text or "")
+        match = re.search(r"(\d+)", text or "")
+        if match:
+            return match.group(1)
+        return None
+
+    @staticmethod
+    def extract_chapter_id(text: str) -> str | None:
+        # 兼容 p456 / P456 / chapter456
+        match = re.search(r"(?:\bp|\bchapter)\s*(\d+)", text or "", flags=re.IGNORECASE)
         if match:
             return match.group(1)
         return None
@@ -196,3 +225,35 @@ class MangaService:
             seen.add(pid)
             ordered.append(pid)
         return ordered
+
+    @staticmethod
+    def _count_images(task_dir: Path) -> int:
+        return len(
+            [
+                p
+                for p in task_dir.rglob("*")
+                if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+            ]
+        )
+
+    def _download_photo_with_retry(self, photo_id: str, option: Any, task_dir: Path, max_retry: int) -> None:
+        # 断点续下：若该章节目录已经存在图片则直接跳过重下。
+        existing = [p for p in task_dir.rglob(f"*{photo_id}*") if p.is_file()]
+        if existing:
+            logger.info(f"[qq_code_listener] 章节已存在，跳过: {photo_id}")
+            return
+
+        last_exc: Exception | None = None
+        for idx in range(1, max_retry + 1):
+            before = self._count_images(task_dir)
+            try:
+                jmcomic.download_photo(photo_id, option)
+                after = self._count_images(task_dir)
+                if after > before:
+                    return
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(f"[qq_code_listener] 章节下载失败 photo={photo_id}, retry={idx}/{max_retry}, err={exc}")
+
+        if last_exc is not None:
+            raise RuntimeError(f"章节下载失败: {photo_id}, err={last_exc}")

@@ -7,6 +7,9 @@
 - 支持群聊与用户白名单控制。
 - 支持漫画搜索（关键词或番号）。
 - 支持漫画下载（番号或链接），并自动：图片 -> PDF -> 改名为 EXE 后缀 -> 加密 ZIP。
+- 支持章节级重试与断点续下，降低大本下载中断概率。
+- 支持指定章节下载：`jmcomic 123 p456`。
+- 支持管理员动态控制最大下载页数和功能开关。
 - 完成后将 ZIP 文件回传到触发聊天窗口。
 - 全流程状态提示与异常友好提示。
 
@@ -50,6 +53,9 @@ pip install -r requirements.txt
 - `search_result_limit`：关键词查询时读取的候选结果上限。
 - `zip_level`：ZIP 压缩等级（0~9）。
 - `zip_password`：ZIP 压缩密码。
+- `default_max_page`：默认最大下载页数（防止超大本任务失控）。
+- `retry_per_chapter`：每章节下载失败重试次数（建议 2~3）。
+- `admin_user_ids`：管理员 QQ 号列表，用于执行管理指令。
 
 ## 4. 指令格式
 
@@ -58,15 +64,17 @@ pip install -r requirements.txt
 1. 搜索漫画
 
 ```text
-/漫画 搜索 关键词
-/漫画 搜索 422866
+/jmcomic 搜索 关键词
+/jmcomic 搜索 422866
 ```
 
 2. 下载漫画（生成 PDF + ZIP 并发送）
 
 ```text
-/漫画 下载 422866
-/漫画 下载 https://18comic.vip/album/422866
+/jmcomic 422866
+/jmcomic 422866 p123456
+/jmcomic 下载 422866
+/jmcomic 下载 https://18comic.vip/album/422866
 ```
 
 可选前缀示例：
@@ -74,6 +82,14 @@ pip install -r requirements.txt
 ```text
 !漫画 搜索 某关键词
 漫画 下载 422866
+```
+
+3. 管理指令（仅 admin_user_ids）
+
+```text
+/jmcomic set maxpage 200
+/jmcomic open
+//jmcomic close
 ```
 
 ## 5. 交互流程
@@ -86,6 +102,8 @@ pip install -r requirements.txt
 - 正在加密压缩 ZIP
 - 正在发送
 - 发送完成
+
+当配置 `default_max_page=200` 时，超出页数会自动截断，仅处理前 200 页。
 
 ## 6. 异常处理
 

@@ -52,5 +52,21 @@
     "description": "ZIP 压缩密码（加密压缩必填）",
     "type": "string",
     "default": "123456"
+  },
+  "default_max_page": {
+    "description": "默认最大下载页数（可被管理员命令覆盖）",
+    "type": "int",
+    "default": 200
+  },
+  "retry_per_chapter": {
+    "description": "每章节下载重试次数",
+    "type": "int",
+    "default": 3
+  },
+  "admin_user_ids": {
+    "description": "管理员 QQ 号列表（用于 /set 与 /jmcomic 命令）",
+    "type": "list",
+    "default": [],
+    "hint": "例如: [\"12345678\", \"87654321\"]"
   }
 }
