@@ -56,7 +56,7 @@
   "cache_root": {
     "description": "下载缓存目录（命中后可直接发送，避免重复下载）",
     "type": "string",
-    "default": "data/JMdownload_for_Astrbot/cache"
+    "default": "data/plugin_data/JMdownload_for_Astrbot/cache"
   },
   "cache_ttl_hours": {
     "description": "缓存有效期（小时）",
@@ -127,6 +127,11 @@
     "description": "同一用户下载指令冷却秒数，0 表示关闭",
     "type": "int",
     "default": 0
+  },
+  "confirm_ttl_seconds": {
+    "description": "超上限确认指令 /yes 的有效时长（秒）",
+    "type": "int",
+    "default": 180
   },
   "audit_log_path": {
     "description": "审计日志 jsonl 文件路径",

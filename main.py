@@ -40,7 +40,7 @@ DEFAULT_CONFIG = {
     "deny_reply_enabled": False,
     "deny_reply_text": "你没有权限使用该功能。",
     "download_root": "data/JMdownload_for_Astrbot",
-    "cache_root": "data/JMdownload_for_Astrbot/cache",
+    "cache_root": "data/plugin_data/JMdownload_for_Astrbot/cache",
     "cache_ttl_hours": 72,
     "search_result_limit": 3,
     "download_profile": "balanced",
@@ -55,12 +55,14 @@ DEFAULT_CONFIG = {
     "group_download_concurrency_limit": 1,
     "daily_quota_per_user": 0,
     "cooldown_seconds": 0,
+    "confirm_ttl_seconds": 180,
     "audit_log_path": "data/JMdownload_for_Astrbot/audit.jsonl",
     "admin_user_ids": [],
 }
 
 STATE_OPEN_KEY = "JMdownload_for_Astrbot_open"
 STATE_MAX_PAGE_KEY = "JMdownload_for_Astrbot_max_page"
+STATE_PENDING_CONFIRM_PREFIX = "JMdownload_for_Astrbot_pending_confirm_"
 
 
 @register(
@@ -147,6 +149,26 @@ class QQCodeListenerPlugin(Star):
             yield event.plain_result(stat_text)
             return
 
+        if action == "confirm_no":
+            await self._clear_pending_confirm(event)
+            yield event.plain_result("已取消待确认下载任务。")
+            return
+
+        if action == "confirm_yes":
+            pending = await self._load_pending_confirm(event)
+            if pending is None:
+                yield event.plain_result("当前没有待确认任务，或确认已超时。")
+                return
+            await self._clear_pending_confirm(event)
+            payload = {
+                "album_id": str(pending.get("album_id") or ""),
+                "chapter_id": pending.get("chapter_id"),
+                "confirmed": True,
+            }
+            expire_at = int(pending.get("expire_at") or 0)
+            remain = max(0, expire_at - int(time.time()))
+            yield event.plain_result(f"已确认，开始任务（原确认剩余 {remain} 秒）。")
+
         if action == "search":
             t0 = time.time()
             try:
@@ -181,7 +203,39 @@ class QQCodeListenerPlugin(Star):
                 )
             return
 
-        # 下载类请求的冷却和配额限制
+        if action == "download" and not bool(payload.get("confirmed")):
+            album_id = str(payload.get("album_id") or "")
+            chapter_id = payload.get("chapter_id")
+            max_page = await self._get_max_page()
+
+            inspect_info = await asyncio.to_thread(self.manga_service.inspect_album_pages, album_id, chapter_id)
+            chapter_count = int(inspect_info.get("chapter_count") or 0)
+            total_pages = int(inspect_info.get("total_pages") or 0)
+            unknown_pages = bool(int(inspect_info.get("unknown_pages") or 0))
+
+            total_pages_text = "未知" if unknown_pages and total_pages <= 0 else str(total_pages)
+            yield event.plain_result(
+                f"下载预检：预计章节数 {chapter_count}，预计总页数 {total_pages_text}，当前上限 {max_page}。"
+            )
+
+            if (not unknown_pages) and total_pages > max_page > 0:
+                ttl = max(30, int(self.config.get("confirm_ttl_seconds", 180) or 180))
+                expire_at = int(time.time()) + ttl
+                await self._save_pending_confirm(
+                    event,
+                    {
+                        "album_id": album_id,
+                        "chapter_id": chapter_id,
+                        "expire_at": expire_at,
+                    },
+                )
+                yield event.plain_result(
+                    f"警告：预计总页数 {total_pages} 超过上限 {max_page}。"
+                    f"如需继续请在 {ttl} 秒内发送 /yes，否则任务取消。"
+                )
+                return
+
+        # 下载类请求的冷却和配额限制（仅在实际开始下载前生效）
         rate_limited = await self._check_rate_limit(event)
         if rate_limited:
             yield event.plain_result(rate_limited)
@@ -362,6 +416,10 @@ class QQCodeListenerPlugin(Star):
             return "stats", {}
         if re.match(r"^(next|下页)$", text, flags=re.IGNORECASE):
             return "search", {"next": True}
+        if re.match(r"^(yes|确认)$", text, flags=re.IGNORECASE):
+            return "confirm_yes", {}
+        if re.match(r"^(no|取消)$", text, flags=re.IGNORECASE):
+            return "confirm_no", {}
 
         patterns = [
             (r"^(搜索|search)\s+(.+)$", "search"),
@@ -595,6 +653,32 @@ class QQCodeListenerPlugin(Star):
         digest = hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
         return f"JMdownload_for_Astrbot_search_state_{digest}"
 
+    def _pending_confirm_key(self, event: AstrMessageEvent) -> str:
+        sender_id = self._extract_sender_id(event)
+        scope = self._build_scope_key(event)
+        raw = f"{scope}|{sender_id}|confirm"
+        digest = hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
+        return f"{STATE_PENDING_CONFIRM_PREFIX}{digest}"
+
+    async def _save_pending_confirm(self, event: AstrMessageEvent, payload: dict[str, Any]) -> None:
+        key = self._pending_confirm_key(event)
+        await self._set_kv(key, payload)
+
+    async def _load_pending_confirm(self, event: AstrMessageEvent) -> dict[str, Any] | None:
+        key = self._pending_confirm_key(event)
+        value = await self._get_kv(key, None)
+        if not isinstance(value, dict):
+            return None
+        expire_at = int(value.get("expire_at") or 0)
+        if expire_at <= int(time.time()):
+            await self._clear_pending_confirm(event)
+            return None
+        return value
+
+    async def _clear_pending_confirm(self, event: AstrMessageEvent) -> None:
+        key = self._pending_confirm_key(event)
+        await self._set_kv(key, None)
+
     async def _save_search_state(self, event: AstrMessageEvent, keyword: str, limit: int, page: int) -> None:
         key = self._search_state_key(event)
         value = {
@@ -637,6 +721,7 @@ class QQCodeListenerPlugin(Star):
             "3) /jmcomic 搜索 关键词 [数量] [p页码]\n"
             "4) /jmcomic next（翻到上一搜索的下一页）\n"
             "5) /jmcomic help | doctor | stats\n"
+            "6) 当超上限预警时，发送 /yes 继续（3分钟内有效），/no 取消\n"
             "管理员:\n"
             "- /jmcomic set maxpage 200\n"
             "- /jmcomic open|close\n"
@@ -653,7 +738,7 @@ class QQCodeListenerPlugin(Star):
             "系统自检:\n"
             f"- download_root: {info.get('download_root', 'unknown')}\n"
             f"- jm_client: {info.get('jm_client', 'unknown')}\n"
-            f"- cache_root: {self.config.get('cache_root', 'data/JMdownload_for_Astrbot/cache')}\n"
+            f"- cache_root: {self.config.get('cache_root', 'data/plugin_data/JMdownload_for_Astrbot/cache')}\n"
             f"- profile: {profile}\n"
             f"- pdf_layout_mode: {layout_mode}\n"
             f"- 并发限制: 全局 {self.config.get('download_concurrency_limit', 2)} / 同群 {self.config.get('group_download_concurrency_limit', 1)}"

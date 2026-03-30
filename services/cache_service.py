@@ -51,7 +51,7 @@ class CacheService:
         return target
 
     def _cache_root(self) -> Path:
-        configured = str(self.config.get("cache_root") or "data/JMdownload_for_Astrbot/cache").strip()
+        configured = str(self.config.get("cache_root") or "data/plugin_data/JMdownload_for_Astrbot/cache").strip()
         return Path(configured)
 
     def _ttl_seconds(self) -> int:

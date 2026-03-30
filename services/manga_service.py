@@ -87,6 +87,7 @@ class MangaService:
         # 优先按章节逐个下载，支持重试与断点续下。
         downloaded = False
         failed_photo_ids: list[str] = []
+        max_pages_limit = max(0, int(max_pages or 0))
         try:
             client = option.new_jm_client()
             album = self._get_album_detail(client, album_id)
@@ -99,6 +100,10 @@ class MangaService:
 
             if photo_ids and hasattr(jmcomic, "download_photo"):
                 for photo_id in photo_ids:
+                    # 在下载阶段执行页数截止，避免“下载完再截断”。
+                    if max_pages_limit > 0 and self._count_images(task_dir) >= max_pages_limit:
+                        break
+
                     try:
                         self._download_photo_with_retry(
                             photo_id=str(photo_id),
@@ -114,6 +119,8 @@ class MangaService:
                 if failed_photo_ids:
                     retry_failed: list[str] = []
                     for photo_id in failed_photo_ids:
+                        if max_pages_limit > 0 and self._count_images(task_dir) >= max_pages_limit:
+                            break
                         try:
                             self._download_photo_with_retry(
                                 photo_id=photo_id,
@@ -139,11 +146,42 @@ class MangaService:
             ]
         )
 
-        if max_pages is not None and max_pages > 0 and len(image_files) > max_pages:
-            image_files = image_files[:max_pages]
+        if max_pages_limit > 0 and len(image_files) > max_pages_limit:
+            for extra in image_files[max_pages_limit:]:
+                try:
+                    extra.unlink()
+                except Exception:
+                    pass
+            image_files = image_files[:max_pages_limit]
 
         logger.info(f"[JMdownload_for_Astrbot] album={album_id} 下载图片数量: {len(image_files)}")
         return task_dir, image_files, failed_photo_ids
+
+    def inspect_album_pages(self, album_id: str, chapter_id: str | None = None) -> dict[str, int]:
+        option = self._build_jm_option(base_dir=self._build_base_dir())
+        client = option.new_jm_client()
+        album = self._get_album_detail(client, album_id)
+
+        photo_items = self._extract_photo_items(album)
+        if chapter_id:
+            chapter_id = str(chapter_id)
+            photo_items = [item for item in photo_items if str(item.get("id") or "") == chapter_id]
+
+        chapter_count = len(photo_items)
+        total_pages = 0
+        unknown = False
+        for item in photo_items:
+            pages = int(item.get("pages") or 0)
+            if pages <= 0:
+                unknown = True
+                continue
+            total_pages += pages
+
+        return {
+            "chapter_count": max(0, chapter_count),
+            "total_pages": max(0, total_pages),
+            "unknown_pages": 1 if unknown else 0,
+        }
 
     def doctor_check(self) -> dict[str, str]:
         info: dict[str, str] = {}
@@ -360,6 +398,38 @@ class MangaService:
             seen.add(pid)
             ordered.append(pid)
         return ordered
+
+    @staticmethod
+    def _extract_photo_items(album: Any) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for attr_name in ["photos", "episode_list", "chapter_list", "episodes"]:
+            obj = getattr(album, attr_name, None)
+            if not obj:
+                continue
+            try:
+                for item in obj:
+                    photo_id = (
+                        getattr(item, "photo_id", None)
+                        or getattr(item, "id", None)
+                        or getattr(item, "album_id", None)
+                    )
+                    pages = (
+                        getattr(item, "page_count", None)
+                        or getattr(item, "total_page", None)
+                        or getattr(item, "images_count", None)
+                        or getattr(item, "image_count", None)
+                    )
+                    result.append(
+                        {
+                            "id": "" if photo_id is None else str(photo_id),
+                            "pages": MangaService._safe_int(pages),
+                        }
+                    )
+            except TypeError:
+                continue
+            if result:
+                break
+        return result
 
     @staticmethod
     def _count_images(task_dir: Path) -> int:

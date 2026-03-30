@@ -63,7 +63,7 @@ pip install -r requirements.txt
 - `deny_reply_enabled`：非白名单触发时是否提示无权限。
 - `deny_reply_text`：无权限提示文案。
 - `download_root`：下载与中间文件目录。
-- `cache_root`：缓存目录（缓存命中会直接发送）。
+- `cache_root`：缓存目录（缓存命中会直接发送，默认 `data/plugin_data/JMdownload_for_Astrbot/cache`）。
 - `cache_ttl_hours`：缓存有效期（小时）。
 - `search_result_limit`：关键词查询时读取的候选结果上限。
 - `download_profile`：质量档位（fast / balanced / high）。
@@ -78,6 +78,7 @@ pip install -r requirements.txt
 - `group_download_concurrency_limit`：同群下载并发上限。
 - `daily_quota_per_user`：每用户每日下载配额，0 为不限。
 - `cooldown_seconds`：同一用户下载冷却时间。
+- `confirm_ttl_seconds`：超上限时 `/yes` 确认有效秒数（默认 180）。
 - `audit_log_path`：审计日志文件路径（jsonl）。
 - `admin_user_ids`：管理员 QQ 号列表，用于执行管理指令。
 
@@ -130,11 +131,14 @@ pip install -r requirements.txt
 /jmcomic help
 /jmcomic doctor
 /jmcomic stats
+/yes
+/no
 ```
 
 ## 5. 交互流程
 
 下载类指令会按顺序提示：
+- 下载前预检（预计章节数/总页数）
 - 正在查询
 - 正在下载
 - 排队中（有并发压力时）
@@ -145,6 +149,11 @@ pip install -r requirements.txt
 - 发送完成
 
 若命中缓存，会直接提示“命中缓存，正在发送”。
+
+当预计总页数超过当前上限时：
+- 会先告警并暂停任务；
+- 需在 `confirm_ttl_seconds`（默认 180 秒）内发送 `/yes` 才会继续；
+- 发送 `/no` 可主动取消待确认任务。
 
 当配置 `default_max_page=200` 时，超出页数会自动截断，仅处理前 200 页。
 
