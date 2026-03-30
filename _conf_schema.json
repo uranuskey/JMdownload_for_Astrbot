@@ -22,6 +22,21 @@
     "default": [],
     "hint": "留空表示不限制用户；有值时仅白名单用户可使用"
   },
+  "blacklist_group_ids": {
+    "description": "禁止使用功能的群聊 ID 黑名单（优先生效）",
+    "type": "list",
+    "default": []
+  },
+  "blacklist_user_ids": {
+    "description": "禁止使用功能的用户 ID 黑名单（优先生效）",
+    "type": "list",
+    "default": []
+  },
+  "allow_group_admin_bypass": {
+    "description": "当设置了 allowed_user_ids 时，是否允许群管理员绕过用户白名单",
+    "type": "bool",
+    "default": true
+  },
   "deny_reply_enabled": {
     "description": "非白名单触发时是否回复无权限提示",
     "type": "bool",
@@ -38,10 +53,40 @@
     "default": "data/JMdownload_for_Astrbot",
     "hint": "建议使用 AstrBot 可写目录"
   },
+  "cache_root": {
+    "description": "下载缓存目录（命中后可直接发送，避免重复下载）",
+    "type": "string",
+    "default": "data/JMdownload_for_Astrbot/cache"
+  },
+  "cache_ttl_hours": {
+    "description": "缓存有效期（小时）",
+    "type": "int",
+    "default": 72
+  },
   "search_result_limit": {
     "description": "关键词搜索时的候选读取基准数量（最终会结合指令数量动态扩大）",
     "type": "int",
     "default": 3
+  },
+  "download_profile": {
+    "description": "下载质量档位：fast / balanced / high",
+    "type": "string",
+    "default": "balanced"
+  },
+  "pdf_layout_mode": {
+    "description": "PDF 布局模式：multipage（多页）/ longpage（单页超长）",
+    "type": "string",
+    "default": "multipage"
+  },
+  "long_page_max_images": {
+    "description": "longpage 模式允许的最大图片数量（超出自动回退 multipage）",
+    "type": "int",
+    "default": 80
+  },
+  "long_page_max_height": {
+    "description": "longpage 模式允许的最大总高度像素（超出自动回退 multipage）",
+    "type": "int",
+    "default": 60000
   },
   "zip_level": {
     "description": "ZIP 压缩等级，范围 0-9",
@@ -62,6 +107,31 @@
     "description": "每章节下载重试次数",
     "type": "int",
     "default": 3
+  },
+  "download_concurrency_limit": {
+    "description": "下载全局并发上限（超出将排队）",
+    "type": "int",
+    "default": 2
+  },
+  "group_download_concurrency_limit": {
+    "description": "同群下载并发上限（建议 1）",
+    "type": "int",
+    "default": 1
+  },
+  "daily_quota_per_user": {
+    "description": "每用户每日下载配额，0 表示不限",
+    "type": "int",
+    "default": 0
+  },
+  "cooldown_seconds": {
+    "description": "同一用户下载指令冷却秒数，0 表示关闭",
+    "type": "int",
+    "default": 0
+  },
+  "audit_log_path": {
+    "description": "审计日志 jsonl 文件路径",
+    "type": "string",
+    "default": "data/JMdownload_for_Astrbot/audit.jsonl"
   },
   "admin_user_ids": {
     "description": "管理员 QQ 号列表（用于 /set 与 /jmcomic 命令）",

@@ -1,7 +1,11 @@
 import asyncio
+import hashlib
 import inspect
 import re
 import shutil
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,11 +18,15 @@ try:
     from .services.manga_service import MangaService
     from .services.package_service import PackageService
     from .services.send_service import SendService
+    from .services.cache_service import CacheService
+    from .services.audit_service import AuditService
 except ImportError:
     from plugin_types import AlbumInfo
     from services.manga_service import MangaService
     from services.package_service import PackageService
     from services.send_service import SendService
+    from services.cache_service import CacheService
+    from services.audit_service import AuditService
 
 
 DEFAULT_CONFIG = {
@@ -26,14 +34,28 @@ DEFAULT_CONFIG = {
     "trigger_keywords": ["/", "!", "漫画"],
     "allowed_group_ids": [],
     "allowed_user_ids": [],
+    "blacklist_group_ids": [],
+    "blacklist_user_ids": [],
+    "allow_group_admin_bypass": True,
     "deny_reply_enabled": False,
     "deny_reply_text": "你没有权限使用该功能。",
     "download_root": "data/JMdownload_for_Astrbot",
+    "cache_root": "data/JMdownload_for_Astrbot/cache",
+    "cache_ttl_hours": 72,
     "search_result_limit": 3,
+    "download_profile": "balanced",
+    "pdf_layout_mode": "multipage",
+    "long_page_max_images": 80,
+    "long_page_max_height": 60000,
     "zip_level": 9,
     "zip_password": "123456",
     "default_max_page": 200,
     "retry_per_chapter": 3,
+    "download_concurrency_limit": 2,
+    "group_download_concurrency_limit": 1,
+    "daily_quota_per_user": 0,
+    "cooldown_seconds": 0,
+    "audit_log_path": "data/JMdownload_for_Astrbot/audit.jsonl",
     "admin_user_ids": [],
 }
 
@@ -45,7 +67,7 @@ STATE_MAX_PAGE_KEY = "JMdownload_for_Astrbot_max_page"
     "JMdownload_for_Astrbot",
     "wzh",
     "禁漫查询下载（白名单+关键词触发）",
-    "2.2.0",
+    "2.3.0",
 )
 class QQCodeListenerPlugin(Star):
     def __init__(
@@ -60,6 +82,14 @@ class QQCodeListenerPlugin(Star):
         self.manga_service = MangaService(self.config)
         self.package_service = PackageService()
         self.send_service = SendService()
+        self.cache_service = CacheService(self.config)
+        self.audit_service = AuditService(self.config)
+        self._queue_lock = asyncio.Lock()
+        self._global_waiting = 0
+        self._scope_waiting: dict[str, int] = {}
+        self._group_semaphores: dict[str, asyncio.Semaphore] = {}
+        global_limit = max(1, int(self.config.get("download_concurrency_limit", 2) or 2))
+        self._global_semaphore = asyncio.Semaphore(global_limit)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
@@ -90,73 +120,206 @@ class QQCodeListenerPlugin(Star):
 
         parsed = self._parse_command(command_text)
         if parsed is None:
-            help_text = (
-                "指令格式:\n"
-                "1) /jmcomic 422866\n"
-                "2) /jmcomic 422866 p123456\n"
-                "3) /jmcomic 搜索 关键词 [数量，默认3]\n"
-                "管理员:\n"
-                "- /jmcomic set maxpage 200\n"
-                "- /jmcomic open|close\n"
-                "兼容旧格式: /漫画 下载 422866"
-            )
-            yield event.plain_result(help_text)
+            yield event.plain_result(self._build_help_text())
             return
 
         action, payload = parsed
+        sender_id = self._extract_sender_id(event)
+        group_id = str(
+            self._get_first_attr(
+                event,
+                ["group_id", "groupid", "room_id", "channel_id", "conversation_id"],
+            )
+            or ""
+        )
+
+        if action == "help":
+            yield event.plain_result(self._build_help_text())
+            return
+
+        if action == "doctor":
+            doctor_text = await asyncio.to_thread(self._build_doctor_text)
+            yield event.plain_result(doctor_text)
+            return
+
+        if action == "stats":
+            stat_text = await asyncio.to_thread(self._build_stats_text)
+            yield event.plain_result(stat_text)
+            return
+
         if action == "search":
+            t0 = time.time()
             try:
                 keyword = str(payload.get("keyword") or "").strip()
                 limit = int(payload.get("limit") or 3)
-                albums = await asyncio.to_thread(self.manga_service.search_albums, keyword, limit)
-                yield event.plain_result(self._format_search_results(keyword, albums))
+                page = int(payload.get("page") or 1)
+                if bool(payload.get("next")):
+                    keyword, limit, page = await self._resolve_next_search_state(event)
+
+                albums = await asyncio.to_thread(self.manga_service.search_albums, keyword, limit, page)
+                await self._save_search_state(event, keyword, limit, page)
+                yield event.plain_result(self._format_search_results(keyword, albums, page))
+                await asyncio.to_thread(
+                    self.audit_service.log_event,
+                    "search",
+                    True,
+                    sender_id,
+                    group_id,
+                    int((time.time() - t0) * 1000),
+                    {"keyword": keyword, "page": page, "limit": limit},
+                )
             except Exception as exc:
                 logger.exception(f"[JMdownload_for_Astrbot] 查询失败: {exc}")
                 yield event.plain_result(f"查询失败：{self._friendly_error(exc)}")
+                await asyncio.to_thread(
+                    self.audit_service.log_event,
+                    "search",
+                    False,
+                    sender_id,
+                    group_id,
+                    int((time.time() - t0) * 1000),
+                )
+            return
+
+        # 下载类请求的冷却和配额限制
+        rate_limited = await self._check_rate_limit(event)
+        if rate_limited:
+            yield event.plain_result(rate_limited)
             return
 
         task_dir: Path | None = None
+        t0 = time.time()
         try:
             album_id = payload.get("album_id")
             chapter_id = payload.get("chapter_id")
             max_page = await self._get_max_page()
             retry_per_chapter = int(self.config.get("retry_per_chapter", 3) or 3)
+            profile = self._normalize_profile(self.config.get("download_profile", "balanced"))
+            layout_mode = self._normalize_layout_mode(self.config.get("pdf_layout_mode", "multipage"))
+            long_page_max_images = int(self.config.get("long_page_max_images", 80) or 80)
+            long_page_max_height = int(self.config.get("long_page_max_height", 60000) or 60000)
+            zip_level = int(self.config.get("zip_level", 9) or 9)
+            zip_password = str(self.config.get("zip_password") or "").strip()
 
-            album = await asyncio.to_thread(self.manga_service.search_album, album_id)
-            yield event.plain_result(f"已定位漫画：{album.title}（ID: {album.album_id}），正在下载图片...")
-
-            task_dir, image_files = await asyncio.to_thread(
-                self.manga_service.download_images,
-                album.album_id,
+            cached_zip = await asyncio.to_thread(
+                self.cache_service.get_cached_zip,
+                str(album_id or ""),
                 chapter_id,
-                retry_per_chapter,
                 max_page,
+                zip_level,
+                zip_password,
+                profile,
             )
-            if not image_files:
-                raise RuntimeError("下载完成但未找到任何图片文件")
+            if cached_zip and cached_zip.exists():
+                yield event.plain_result(f"命中缓存，正在发送：{cached_zip.name}")
+                sent = await self.send_service.send_file_chain(event, cached_zip)
+                if sent:
+                    yield event.plain_result("发送完成。")
+                else:
+                    yield event.plain_result(f"缓存文件发送失败，请手动取文件：{cached_zip}")
+                await asyncio.to_thread(
+                    self.audit_service.log_event,
+                    "download",
+                    sent,
+                    sender_id,
+                    group_id,
+                    int((time.time() - t0) * 1000),
+                    {"album_id": album_id, "chapter_id": chapter_id, "cache_hit": True},
+                )
+                return
 
-            if len(image_files) <= 2 and len(album.chapters) >= 2:
-                yield event.plain_result("该漫画章节较多但实际下载页数很少，可能是章节权限、限流或网络问题。")
+            scope = self._build_scope_key(event)
+            async with self._acquire_download_slot(scope) as queue_info:
+                ahead = int(queue_info.get("ahead", 0))
+                if ahead > 0:
+                    yield event.plain_result(f"任务较多，已加入队列，前方约 {ahead} 个任务。")
 
-            pdf_path = await asyncio.to_thread(self.package_service.images_to_pdf, image_files, task_dir, album.album_id)
-            exe_path = await asyncio.to_thread(self.package_service.rename_pdf_to_exe, pdf_path)
-            zip_path = await asyncio.to_thread(
-                self.package_service.zip_with_password,
-                exe_path,
-                task_dir,
-                album.album_id,
-                int(self.config.get("zip_level", 9) or 9),
-                str(self.config.get("zip_password") or "").strip(),
-            )
+                album = await asyncio.to_thread(self.manga_service.search_album, album_id)
+                yield event.plain_result(f"已定位漫画：{album.title}（ID: {album.album_id}），正在下载图片...")
 
-            sent = await self.send_service.send_file_chain(event, zip_path)
-            if sent:
-                yield event.plain_result("发送完成。")
-            else:
-                yield event.plain_result(f"消息链文件发送失败，请手动取文件：{zip_path}")
+                task_dir, image_files, failed_photos = await asyncio.to_thread(
+                    self.manga_service.download_images,
+                    album.album_id,
+                    chapter_id,
+                    retry_per_chapter,
+                    max_page,
+                )
+                if not image_files:
+                    raise RuntimeError("下载完成但未找到任何图片文件")
+
+                if len(image_files) <= 2 and len(album.chapters) >= 2:
+                    yield event.plain_result("该漫画章节较多但实际下载页数很少，可能是章节权限、限流或网络问题。")
+
+                if failed_photos:
+                    preview = ", ".join(failed_photos[:10])
+                    suffix = " ..." if len(failed_photos) > 10 else ""
+                    yield event.plain_result(f"补偿重试后仍有章节失败（{len(failed_photos)}）：{preview}{suffix}")
+
+                pdf_path = await asyncio.to_thread(
+                    self.package_service.images_to_pdf,
+                    image_files,
+                    task_dir,
+                    album.album_id,
+                    profile,
+                    layout_mode,
+                    long_page_max_images,
+                    long_page_max_height,
+                )
+                exe_path = await asyncio.to_thread(self.package_service.rename_pdf_to_exe, pdf_path)
+                zip_path = await asyncio.to_thread(
+                    self.package_service.zip_with_password,
+                    exe_path,
+                    task_dir,
+                    album.album_id,
+                    zip_level,
+                    zip_password,
+                )
+
+                cache_path = await asyncio.to_thread(
+                    self.cache_service.save_cache,
+                    zip_path,
+                    album.album_id,
+                    chapter_id,
+                    max_page,
+                    zip_level,
+                    zip_password,
+                    profile,
+                )
+
+                sent = await self.send_service.send_file_chain(event, cache_path)
+                if sent:
+                    yield event.plain_result("发送完成。")
+                else:
+                    yield event.plain_result(f"消息链文件发送失败，请手动取文件：{cache_path}")
+
+                await asyncio.to_thread(
+                    self.audit_service.log_event,
+                    "download",
+                    sent,
+                    sender_id,
+                    group_id,
+                    int((time.time() - t0) * 1000),
+                    {
+                        "album_id": album.album_id,
+                        "chapter_id": chapter_id,
+                        "cache_hit": False,
+                        "failed_chapters": failed_photos,
+                        "profile": profile,
+                        "layout_mode": layout_mode,
+                    },
+                )
         except Exception as exc:
             logger.exception(f"[JMdownload_for_Astrbot] 下载流程失败: {exc}")
             yield event.plain_result(f"处理失败：{self._friendly_error(exc)}")
+            await asyncio.to_thread(
+                self.audit_service.log_event,
+                "download",
+                False,
+                sender_id,
+                group_id,
+                int((time.time() - t0) * 1000),
+                {"album_id": payload.get("album_id"), "chapter_id": payload.get("chapter_id")},
+            )
         finally:
             if task_dir and task_dir.exists():
                 try:
@@ -179,7 +342,7 @@ class QQCodeListenerPlugin(Star):
                 return body
         return None
 
-    def _parse_command(self, command_text: str) -> tuple[str, str | dict[str, str | None]] | None:
+    def _parse_command(self, command_text: str) -> tuple[str, dict[str, Any]] | None:
         if not command_text:
             return None
 
@@ -190,6 +353,15 @@ class QQCodeListenerPlugin(Star):
         text = re.sub(r"^jmcomic\b", "", text, flags=re.IGNORECASE).strip()
         if not text:
             return None
+
+        if re.match(r"^(help|帮助)$", text, flags=re.IGNORECASE):
+            return "help", {}
+        if re.match(r"^(doctor|自检)$", text, flags=re.IGNORECASE):
+            return "doctor", {}
+        if re.match(r"^(stats|统计)$", text, flags=re.IGNORECASE):
+            return "stats", {}
+        if re.match(r"^(next|下页)$", text, flags=re.IGNORECASE):
+            return "search", {"next": True}
 
         patterns = [
             (r"^(搜索|search)\s+(.+)$", "search"),
@@ -225,18 +397,31 @@ class QQCodeListenerPlugin(Star):
         }
 
     @staticmethod
-    def _parse_search_payload(text: str) -> dict[str, str | int]:
+    def _parse_search_payload(text: str) -> dict[str, Any]:
         payload_text = (text or "").strip()
         if not payload_text:
-            return {"keyword": "", "limit": 3}
+            return {"keyword": "", "limit": 3, "page": 1}
 
+        if re.match(r"^(next|下页)$", payload_text, flags=re.IGNORECASE):
+            return {"next": True}
+
+        tokens = [t for t in payload_text.split() if t.strip()]
+        keyword_parts: list[str] = []
         limit = 3
-        match = re.match(r"^(.+?)\s+(\d+)$", payload_text)
-        if match:
-            payload_text = match.group(1).strip()
-            limit = max(1, min(20, int(match.group(2))))
+        page = 1
 
-        return {"keyword": payload_text, "limit": limit}
+        for token in tokens:
+            page_match = re.match(r"^[pP](\d+)$", token)
+            if page_match:
+                page = max(1, int(page_match.group(1)))
+                continue
+            if token.isdigit():
+                limit = max(1, min(20, int(token)))
+                continue
+            keyword_parts.append(token)
+
+        keyword = " ".join(keyword_parts).strip()
+        return {"keyword": keyword, "limit": limit, "page": page}
 
     def _allowed_event(self, event: AstrMessageEvent) -> bool:
         group_id = self._get_first_attr(
@@ -250,11 +435,20 @@ class QQCodeListenerPlugin(Star):
 
         allowed_group_ids = set(self._to_string_list(self.config.get("allowed_group_ids", [])))
         allowed_user_ids = set(self._to_string_list(self.config.get("allowed_user_ids", [])))
+        blacklist_group_ids = set(self._to_string_list(self.config.get("blacklist_group_ids", [])))
+        blacklist_user_ids = set(self._to_string_list(self.config.get("blacklist_user_ids", [])))
+
+        if blacklist_group_ids and group_id and str(group_id) in blacklist_group_ids:
+            return False
+        if blacklist_user_ids and user_id and str(user_id) in blacklist_user_ids:
+            return False
 
         if allowed_group_ids and group_id and str(group_id) not in allowed_group_ids:
             return False
         if allowed_user_ids and user_id and str(user_id) not in allowed_user_ids:
-            return False
+            allow_admin_bypass = bool(self.config.get("allow_group_admin_bypass", True))
+            if not (allow_admin_bypass and self._is_group_admin_event(event)):
+                return False
         return True
 
     @staticmethod
@@ -321,6 +515,163 @@ class QQCodeListenerPlugin(Star):
         )
         return "" if uid is None else str(uid)
 
+    def _is_group_admin_event(self, event: AstrMessageEvent) -> bool:
+        role = str(self._get_first_attr(event, ["sender_role", "role", "member_role"]) or "").lower()
+        if role in {"admin", "owner", "group_admin", "administrator"}:
+            return True
+
+        flag = self._get_first_attr(event, ["is_admin", "is_group_admin", "is_owner"])
+        if isinstance(flag, bool):
+            return flag
+        return str(flag).lower() in {"true", "1", "yes"}
+
+    async def _check_rate_limit(self, event: AstrMessageEvent) -> str | None:
+        sender_id = self._extract_sender_id(event)
+        if not sender_id:
+            return None
+
+        cooldown = max(0, int(self.config.get("cooldown_seconds", 0) or 0))
+        if cooldown > 0:
+            key = f"JMdownload_for_Astrbot_cooldown_{sender_id}"
+            last_ts = float(await self._get_kv(key, 0) or 0)
+            now = time.time()
+            remain = int(cooldown - (now - last_ts))
+            if remain > 0:
+                return f"操作过于频繁，请 {remain} 秒后再试。"
+            await self._set_kv(key, now)
+
+        quota = max(0, int(self.config.get("daily_quota_per_user", 0) or 0))
+        if quota > 0:
+            day = datetime.now().strftime("%Y%m%d")
+            key = f"JMdownload_for_Astrbot_quota_{day}_{sender_id}"
+            used = int(await self._get_kv(key, 0) or 0)
+            if used >= quota:
+                return f"你今日下载额度已用尽（{quota}/{quota}）。"
+            await self._set_kv(key, used + 1)
+        return None
+
+    def _build_scope_key(self, event: AstrMessageEvent) -> str:
+        group_id = self._get_first_attr(
+            event,
+            ["group_id", "groupid", "room_id", "channel_id", "conversation_id"],
+        )
+        if group_id is not None and str(group_id).strip() != "":
+            return f"group:{group_id}"
+        return f"user:{self._extract_sender_id(event) or 'unknown'}"
+
+    def _get_group_semaphore(self, scope_key: str) -> asyncio.Semaphore:
+        if scope_key not in self._group_semaphores:
+            limit = max(1, int(self.config.get("group_download_concurrency_limit", 1) or 1))
+            self._group_semaphores[scope_key] = asyncio.Semaphore(limit)
+        return self._group_semaphores[scope_key]
+
+    @asynccontextmanager
+    async def _acquire_download_slot(self, scope_key: str):
+        sem = self._get_group_semaphore(scope_key)
+        async with self._queue_lock:
+            self._global_waiting += 1
+            self._scope_waiting[scope_key] = self._scope_waiting.get(scope_key, 0) + 1
+            ahead = max(self._global_waiting - 1, self._scope_waiting[scope_key] - 1)
+
+        entered = False
+        try:
+            async with self._global_semaphore:
+                async with sem:
+                    entered = True
+                    async with self._queue_lock:
+                        self._global_waiting = max(0, self._global_waiting - 1)
+                        self._scope_waiting[scope_key] = max(0, self._scope_waiting.get(scope_key, 1) - 1)
+                    yield {"ahead": ahead}
+        finally:
+            if not entered:
+                async with self._queue_lock:
+                    self._global_waiting = max(0, self._global_waiting - 1)
+                    self._scope_waiting[scope_key] = max(0, self._scope_waiting.get(scope_key, 1) - 1)
+
+    def _search_state_key(self, event: AstrMessageEvent) -> str:
+        sender_id = self._extract_sender_id(event)
+        scope = self._build_scope_key(event)
+        raw = f"{scope}|{sender_id}"
+        digest = hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
+        return f"JMdownload_for_Astrbot_search_state_{digest}"
+
+    async def _save_search_state(self, event: AstrMessageEvent, keyword: str, limit: int, page: int) -> None:
+        key = self._search_state_key(event)
+        value = {
+            "keyword": str(keyword or "").strip(),
+            "limit": max(1, int(limit or 3)),
+            "page": max(1, int(page or 1)),
+        }
+        await self._set_kv(key, value)
+
+    async def _resolve_next_search_state(self, event: AstrMessageEvent) -> tuple[str, int, int]:
+        key = self._search_state_key(event)
+        state = await self._get_kv(key, None)
+        if not isinstance(state, dict):
+            raise RuntimeError("没有可翻页的历史搜索，请先执行一次“搜索 关键词”。")
+
+        keyword = str(state.get("keyword") or "").strip()
+        limit = max(1, int(state.get("limit") or 3))
+        page = max(1, int(state.get("page") or 1)) + 1
+        if not keyword:
+            raise RuntimeError("没有可翻页的历史搜索，请先执行一次“搜索 关键词”。")
+        return keyword, limit, page
+
+    def _normalize_profile(self, value: Any) -> str:
+        profile = str(value or "balanced").strip().lower()
+        if profile not in {"fast", "balanced", "high"}:
+            return "balanced"
+        return profile
+
+    def _normalize_layout_mode(self, value: Any) -> str:
+        mode = str(value or "multipage").strip().lower()
+        if mode not in {"multipage", "longpage"}:
+            return "multipage"
+        return mode
+
+    def _build_help_text(self) -> str:
+        return (
+            "指令格式:\n"
+            "1) /jmcomic 422866\n"
+            "2) /jmcomic 422866 p123456\n"
+            "3) /jmcomic 搜索 关键词 [数量] [p页码]\n"
+            "4) /jmcomic next（翻到上一搜索的下一页）\n"
+            "5) /jmcomic help | doctor | stats\n"
+            "管理员:\n"
+            "- /jmcomic set maxpage 200\n"
+            "- /jmcomic open|close\n"
+            "说明:\n"
+            "- 搜索默认返回 3 条，最大 20 条\n"
+            "- 支持缓存复用、失败章节补偿重试、下载队列限流"
+        )
+
+    def _build_doctor_text(self) -> str:
+        info = self.manga_service.doctor_check()
+        profile = self._normalize_profile(self.config.get("download_profile", "balanced"))
+        layout_mode = self._normalize_layout_mode(self.config.get("pdf_layout_mode", "multipage"))
+        return (
+            "系统自检:\n"
+            f"- download_root: {info.get('download_root', 'unknown')}\n"
+            f"- jm_client: {info.get('jm_client', 'unknown')}\n"
+            f"- cache_root: {self.config.get('cache_root', 'data/JMdownload_for_Astrbot/cache')}\n"
+            f"- profile: {profile}\n"
+            f"- pdf_layout_mode: {layout_mode}\n"
+            f"- 并发限制: 全局 {self.config.get('download_concurrency_limit', 2)} / 同群 {self.config.get('group_download_concurrency_limit', 1)}"
+        )
+
+    def _build_stats_text(self) -> str:
+        summary = self.audit_service.summarize(days=7)
+        return (
+            "近 7 天统计:\n"
+            f"- 总请求: {summary.get('total', 0)}\n"
+            f"- 成功: {summary.get('success', 0)}\n"
+            f"- 失败: {summary.get('failed', 0)}\n"
+            f"- 搜索: {summary.get('search', 0)}\n"
+            f"- 下载: {summary.get('download', 0)}\n"
+            f"- 缓存命中: {summary.get('cache_hit', 0)}\n"
+            f"- 平均耗时: {summary.get('avg_duration_ms', 0)} ms"
+        )
+
     async def _is_feature_open(self) -> bool:
         value = await self._get_kv(STATE_OPEN_KEY, True)
         return bool(value)
@@ -378,11 +729,11 @@ class QQCodeListenerPlugin(Star):
         )
 
     @staticmethod
-    def _format_search_results(keyword: str, albums: list[AlbumInfo]) -> str:
+    def _format_search_results(keyword: str, albums: list[AlbumInfo], page: int) -> str:
         if not albums:
             return "未找到匹配漫画，请尝试更换关键词。"
 
-        lines = [f"搜索结果（按热度排序，关键词: {keyword}）:"]
+        lines = [f"搜索结果（按热度排序，关键词: {keyword}，第 {page} 页）:"]
         for idx, album in enumerate(albums, start=1):
             lines.append(
                 f"{idx}. [{album.album_id}] {album.title}\n"
@@ -390,4 +741,5 @@ class QQCodeListenerPlugin(Star):
                 f"热度: {album.heat_score}\n"
                 f"简介: {album.intro[:120]}"
             )
+        lines.append("发送 /jmcomic next 可查看下一页。")
         return "\n\n".join(lines)

@@ -22,12 +22,13 @@ class MangaService:
             raise RuntimeError("未找到匹配漫画，请尝试更换关键词或直接输入番号")
         return albums[0]
 
-    def search_albums(self, query: str, limit: int = 3) -> list[AlbumInfo]:
+    def search_albums(self, query: str, limit: int = 3, page: int = 1) -> list[AlbumInfo]:
         query = query.strip()
         if not query:
             raise RuntimeError("搜索关键词不能为空")
 
         limit = max(1, int(limit or 1))
+        page = max(1, int(page or 1))
         album_id = self.extract_album_id(query)
 
         option = self._build_jm_option(base_dir=self._build_base_dir())
@@ -41,9 +42,9 @@ class MangaService:
 
         search_obj = None
         if hasattr(client, "search_site"):
-            search_obj = client.search_site(query, page=1)
+            search_obj = client.search_site(query, page=page)
         elif hasattr(client, "search"):
-            search_obj = client.search(query, page=1)
+            search_obj = client.search(query, page=page)
 
         configured_pool = int(self.config.get("search_result_limit", 3) or 3)
         candidate_pool = max(configured_pool, limit * 3)
@@ -75,7 +76,7 @@ class MangaService:
         chapter_id: str | None = None,
         retry_per_chapter: int = 3,
         max_pages: int | None = None,
-    ) -> tuple[Path, list[Path]]:
+    ) -> tuple[Path, list[Path], list[str]]:
         task_dir = self._build_base_dir() / f"task_{album_id}_{uuid.uuid4().hex[:8]}"
         task_dir.mkdir(parents=True, exist_ok=True)
 
@@ -85,6 +86,7 @@ class MangaService:
 
         # 优先按章节逐个下载，支持重试与断点续下。
         downloaded = False
+        failed_photo_ids: list[str] = []
         try:
             client = option.new_jm_client()
             album = self._get_album_detail(client, album_id)
@@ -97,18 +99,37 @@ class MangaService:
 
             if photo_ids and hasattr(jmcomic, "download_photo"):
                 for photo_id in photo_ids:
-                    self._download_photo_with_retry(
-                        photo_id=str(photo_id),
-                        option=option,
-                        task_dir=task_dir,
-                        max_retry=max(1, int(retry_per_chapter or 1)),
-                    )
+                    try:
+                        self._download_photo_with_retry(
+                            photo_id=str(photo_id),
+                            option=option,
+                            task_dir=task_dir,
+                            max_retry=max(1, int(retry_per_chapter or 1)),
+                        )
+                    except Exception:
+                        failed_photo_ids.append(str(photo_id))
                 downloaded = True
+
+                # 补偿重试：第一轮失败章节在任务尾部再重试一次。
+                if failed_photo_ids:
+                    retry_failed: list[str] = []
+                    for photo_id in failed_photo_ids:
+                        try:
+                            self._download_photo_with_retry(
+                                photo_id=photo_id,
+                                option=option,
+                                task_dir=task_dir,
+                                max_retry=max(1, int(retry_per_chapter or 1)),
+                            )
+                        except Exception:
+                            retry_failed.append(photo_id)
+                    failed_photo_ids = retry_failed
         except Exception as exc:
             logger.warning(f"[JMdownload_for_Astrbot] 逐章节下载失败，回退整本下载: {exc}")
 
-        if not downloaded:
+        if not downloaded or self._count_images(task_dir) == 0:
             jmcomic.download_album([album_id], option)
+            failed_photo_ids = []
 
         image_files = sorted(
             [
@@ -122,7 +143,26 @@ class MangaService:
             image_files = image_files[:max_pages]
 
         logger.info(f"[JMdownload_for_Astrbot] album={album_id} 下载图片数量: {len(image_files)}")
-        return task_dir, image_files
+        return task_dir, image_files, failed_photo_ids
+
+    def doctor_check(self) -> dict[str, str]:
+        info: dict[str, str] = {}
+        try:
+            base_dir = self._build_base_dir()
+            base_dir.mkdir(parents=True, exist_ok=True)
+            info["download_root"] = f"ok: {base_dir}"
+        except Exception as exc:
+            info["download_root"] = f"error: {exc}"
+
+        try:
+            option = self._build_jm_option(base_dir=self._build_base_dir())
+            client = option.new_jm_client()
+            has_search = hasattr(client, "search_site") or hasattr(client, "search")
+            info["jm_client"] = "ok" if has_search else "error: client 不支持搜索接口"
+        except Exception as exc:
+            info["jm_client"] = f"error: {exc}"
+
+        return info
 
     @staticmethod
     def extract_album_id(text: str) -> str | None:
