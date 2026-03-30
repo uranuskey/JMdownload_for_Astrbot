@@ -35,11 +35,11 @@
   "download_root": {
     "description": "下载与中间文件目录",
     "type": "string",
-    "default": "data/qq_code_listener",
+    "default": "data/JMdownload_for_Astrbot",
     "hint": "建议使用 AstrBot 可写目录"
   },
   "search_result_limit": {
-    "description": "关键词搜索时最多读取结果数量",
+    "description": "关键词搜索时的候选读取基准数量（最终会结合指令数量动态扩大）",
     "type": "int",
     "default": 3
   },

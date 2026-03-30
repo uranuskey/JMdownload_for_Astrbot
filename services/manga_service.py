@@ -17,7 +17,17 @@ class MangaService:
         self.config = config
 
     def search_album(self, query: str) -> AlbumInfo:
+        albums = self.search_albums(query, limit=1)
+        if not albums:
+            raise RuntimeError("未找到匹配漫画，请尝试更换关键词或直接输入番号")
+        return albums[0]
+
+    def search_albums(self, query: str, limit: int = 3) -> list[AlbumInfo]:
         query = query.strip()
+        if not query:
+            raise RuntimeError("搜索关键词不能为空")
+
+        limit = max(1, int(limit or 1))
         album_id = self.extract_album_id(query)
 
         option = self._build_jm_option(base_dir=self._build_base_dir())
@@ -25,7 +35,9 @@ class MangaService:
 
         if album_id:
             album = self._get_album_detail(client, album_id)
-            return self._normalize_album(album)
+            normalized = self._normalize_album(album)
+            normalized.heat_score = self._extract_heat_score(album)
+            return [normalized]
 
         search_obj = None
         if hasattr(client, "search_site"):
@@ -33,26 +45,29 @@ class MangaService:
         elif hasattr(client, "search"):
             search_obj = client.search(query, page=1)
 
-        candidate_ids: list[str] = []
-        if search_obj is not None:
-            if hasattr(search_obj, "iter_id_title_tag"):
-                for item in search_obj.iter_id_title_tag():
-                    if not item:
-                        continue
-                    candidate_ids.append(str(item[0]))
-                    if len(candidate_ids) >= int(self.config.get("search_result_limit", 3)):
-                        break
-            elif isinstance(search_obj, list):
-                for item in search_obj:
-                    item_id = getattr(item, "album_id", None) or getattr(item, "id", None)
-                    if item_id:
-                        candidate_ids.append(str(item_id))
+        configured_pool = int(self.config.get("search_result_limit", 3) or 3)
+        candidate_pool = max(configured_pool, limit * 3)
+        candidate_pool = min(50, max(10, candidate_pool))
+        candidate_ids = self._extract_candidate_ids(search_obj, candidate_pool)
 
         if not candidate_ids:
             raise RuntimeError("未找到匹配漫画，请尝试更换关键词或直接输入番号")
 
-        album = self._get_album_detail(client, candidate_ids[0])
-        return self._normalize_album(album)
+        albums: list[AlbumInfo] = []
+        for candidate_id in candidate_ids:
+            try:
+                album = self._get_album_detail(client, candidate_id)
+                normalized = self._normalize_album(album)
+                normalized.heat_score = self._extract_heat_score(album)
+                albums.append(normalized)
+            except Exception as exc:
+                logger.warning(f"[JMdownload_for_Astrbot] 获取候选详情失败 id={candidate_id}, err={exc}")
+
+        if not albums:
+            raise RuntimeError("搜索结果解析失败，请稍后重试")
+
+        albums.sort(key=lambda item: item.heat_score, reverse=True)
+        return albums[:limit]
 
     def download_images(
         self,
@@ -90,7 +105,7 @@ class MangaService:
                     )
                 downloaded = True
         except Exception as exc:
-            logger.warning(f"[qq_code_listener] 逐章节下载失败，回退整本下载: {exc}")
+            logger.warning(f"[JMdownload_for_Astrbot] 逐章节下载失败，回退整本下载: {exc}")
 
         if not downloaded:
             jmcomic.download_album([album_id], option)
@@ -106,7 +121,7 @@ class MangaService:
         if max_pages is not None and max_pages > 0 and len(image_files) > max_pages:
             image_files = image_files[:max_pages]
 
-        logger.info(f"[qq_code_listener] album={album_id} 下载图片数量: {len(image_files)}")
+        logger.info(f"[JMdownload_for_Astrbot] album={album_id} 下载图片数量: {len(image_files)}")
         return task_dir, image_files
 
     @staticmethod
@@ -125,7 +140,7 @@ class MangaService:
         return None
 
     def _build_base_dir(self) -> Path:
-        configured = str(self.config.get("download_root") or "data/qq_code_listener").strip()
+        configured = str(self.config.get("download_root") or "data/JMdownload_for_Astrbot").strip()
         return Path(configured)
 
     def _build_jm_option(self, base_dir: Path):
@@ -194,7 +209,87 @@ class MangaService:
             author=author,
             cover_url=cover_url,
             chapters=chapters,
+            heat_score=self._extract_heat_score(album),
         )
+
+    @staticmethod
+    def _extract_candidate_ids(search_obj: Any, max_count: int) -> list[str]:
+        ids: list[str] = []
+
+        def _append_candidate(item_id: Any) -> None:
+            if item_id is None:
+                return
+            value = str(item_id).strip()
+            if not value or value in ids:
+                return
+            ids.append(value)
+
+        if search_obj is None:
+            return ids
+
+        if hasattr(search_obj, "iter_id_title_tag"):
+            for item in search_obj.iter_id_title_tag():
+                if not item:
+                    continue
+                if isinstance(item, (list, tuple)) and len(item) >= 1:
+                    _append_candidate(item[0])
+                if len(ids) >= max_count:
+                    return ids
+
+        list_sources = []
+        if isinstance(search_obj, list):
+            list_sources.append(search_obj)
+        for attr_name in ["albums", "result", "results", "content", "list"]:
+            value = getattr(search_obj, attr_name, None)
+            if isinstance(value, list):
+                list_sources.append(value)
+
+        for source in list_sources:
+            for item in source:
+                _append_candidate(getattr(item, "album_id", None) or getattr(item, "id", None) or item)
+                if len(ids) >= max_count:
+                    return ids
+
+        return ids
+
+    @staticmethod
+    def _extract_heat_score(album: Any) -> int:
+        # 兼容不同字段命名，按权重合成一个可比较的“热度分”。
+        weighted_fields = [
+            ("total_views", 1),
+            ("views", 1),
+            ("view_count", 1),
+            ("month_views", 1),
+            ("week_views", 1),
+            ("total_likes", 20),
+            ("likes", 20),
+            ("like_count", 20),
+            ("favorite_count", 10),
+            ("favorites", 10),
+            ("comment_count", 3),
+            ("comments_count", 3),
+        ]
+        score = 0
+        for field_name, weight in weighted_fields:
+            score += MangaService._safe_int(getattr(album, field_name, None)) * weight
+        return max(0, int(score))
+
+    @staticmethod
+    def _safe_int(value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        text = str(value).strip().replace(",", "")
+        match = re.search(r"-?\d+", text)
+        if not match:
+            return 0
+        try:
+            return int(match.group(0))
+        except Exception:
+            return 0
 
     @staticmethod
     def _extract_photo_ids(album: Any) -> list[str]:
@@ -240,7 +335,7 @@ class MangaService:
         # 断点续下：若该章节目录已经存在图片则直接跳过重下。
         existing = [p for p in task_dir.rglob(f"*{photo_id}*") if p.is_file()]
         if existing:
-            logger.info(f"[qq_code_listener] 章节已存在，跳过: {photo_id}")
+            logger.info(f"[JMdownload_for_Astrbot] 章节已存在，跳过: {photo_id}")
             return
 
         last_exc: Exception | None = None
@@ -253,7 +348,7 @@ class MangaService:
                     return
             except Exception as exc:
                 last_exc = exc
-                logger.warning(f"[qq_code_listener] 章节下载失败 photo={photo_id}, retry={idx}/{max_retry}, err={exc}")
+                logger.warning(f"[JMdownload_for_Astrbot] 章节下载失败 photo={photo_id}, retry={idx}/{max_retry}, err={exc}")
 
         if last_exc is not None:
             raise RuntimeError(f"章节下载失败: {photo_id}, err={last_exc}")

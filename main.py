@@ -28,7 +28,7 @@ DEFAULT_CONFIG = {
     "allowed_user_ids": [],
     "deny_reply_enabled": False,
     "deny_reply_text": "你没有权限使用该功能。",
-    "download_root": "data/qq_code_listener",
+    "download_root": "data/JMdownload_for_Astrbot",
     "search_result_limit": 3,
     "zip_level": 9,
     "zip_password": "123456",
@@ -37,12 +37,12 @@ DEFAULT_CONFIG = {
     "admin_user_ids": [],
 }
 
-STATE_OPEN_KEY = "qq_code_listener_open"
-STATE_MAX_PAGE_KEY = "qq_code_listener_max_page"
+STATE_OPEN_KEY = "JMdownload_for_Astrbot_open"
+STATE_MAX_PAGE_KEY = "JMdownload_for_Astrbot_max_page"
 
 
 @register(
-    "qq_code_listener",
+    "JMdownload_for_Astrbot",
     "wzh",
     "禁漫查询下载（白名单+关键词触发）",
     "2.2.0",
@@ -94,7 +94,7 @@ class QQCodeListenerPlugin(Star):
                 "指令格式:\n"
                 "1) /jmcomic 422866\n"
                 "2) /jmcomic 422866 p123456\n"
-                "3) /jmcomic 搜索 关键词\n"
+                "3) /jmcomic 搜索 关键词 [数量，默认3]\n"
                 "管理员:\n"
                 "- /jmcomic set maxpage 200\n"
                 "- /jmcomic open|close\n"
@@ -106,10 +106,12 @@ class QQCodeListenerPlugin(Star):
         action, payload = parsed
         if action == "search":
             try:
-                album = await asyncio.to_thread(self.manga_service.search_album, payload)
-                yield event.plain_result(self._format_album_info(album))
+                keyword = str(payload.get("keyword") or "").strip()
+                limit = int(payload.get("limit") or 3)
+                albums = await asyncio.to_thread(self.manga_service.search_albums, keyword, limit)
+                yield event.plain_result(self._format_search_results(keyword, albums))
             except Exception as exc:
-                logger.exception(f"[qq_code_listener] 查询失败: {exc}")
+                logger.exception(f"[JMdownload_for_Astrbot] 查询失败: {exc}")
                 yield event.plain_result(f"查询失败：{self._friendly_error(exc)}")
             return
 
@@ -153,7 +155,7 @@ class QQCodeListenerPlugin(Star):
             else:
                 yield event.plain_result(f"消息链文件发送失败，请手动取文件：{zip_path}")
         except Exception as exc:
-            logger.exception(f"[qq_code_listener] 下载流程失败: {exc}")
+            logger.exception(f"[JMdownload_for_Astrbot] 下载流程失败: {exc}")
             yield event.plain_result(f"处理失败：{self._friendly_error(exc)}")
         finally:
             if task_dir and task_dir.exists():
@@ -182,8 +184,12 @@ class QQCodeListenerPlugin(Star):
             return None
 
         text = command_text.strip()
+        text = re.sub(r"^/+", "", text)
         if text.startswith("漫画"):
             text = text[2:].strip()
+        text = re.sub(r"^jmcomic\b", "", text, flags=re.IGNORECASE).strip()
+        if not text:
+            return None
 
         patterns = [
             (r"^(搜索|search)\s+(.+)$", "search"),
@@ -194,16 +200,8 @@ class QQCodeListenerPlugin(Star):
             if match:
                 payload_text = match.group(2).strip()
                 if action == "search":
-                    return "search", payload_text
+                    return "search", self._parse_search_payload(payload_text)
                 return "download", self._parse_download_payload(payload_text)
-
-        # 兼容: jmcomic 123 p456
-        jm_match = re.match(r"^jmcomic\s+(.+)$", text, flags=re.IGNORECASE)
-        if jm_match:
-            payload_text = jm_match.group(1).strip()
-            payload = self._parse_download_payload(payload_text)
-            if payload.get("album_id"):
-                return "download", payload
 
         # 兼容: 唤醒词 + 纯数字
         number_match = re.match(r"^(\d+)(?:\s+p?(\d+))?$", text, flags=re.IGNORECASE)
@@ -225,6 +223,20 @@ class QQCodeListenerPlugin(Star):
             "album_id": album_id,
             "chapter_id": chapter_id,
         }
+
+    @staticmethod
+    def _parse_search_payload(text: str) -> dict[str, str | int]:
+        payload_text = (text or "").strip()
+        if not payload_text:
+            return {"keyword": "", "limit": 3}
+
+        limit = 3
+        match = re.match(r"^(.+?)\s+(\d+)$", payload_text)
+        if match:
+            payload_text = match.group(1).strip()
+            limit = max(1, min(20, int(match.group(2))))
+
+        return {"keyword": payload_text, "limit": limit}
 
     def _allowed_event(self, event: AstrMessageEvent) -> bool:
         group_id = self._get_first_attr(
@@ -342,7 +354,7 @@ class QQCodeListenerPlugin(Star):
             if inspect.isawaitable(result):
                 await result
         except Exception:
-            logger.warning(f"[qq_code_listener] 写入 KV 失败: key={key}")
+            logger.warning(f"[JMdownload_for_Astrbot] 写入 KV 失败: key={key}")
 
     @staticmethod
     def _friendly_error(exc: Exception) -> str:
@@ -359,7 +371,23 @@ class QQCodeListenerPlugin(Star):
             f"ID: {album.album_id}\n"
             f"标题: {album.title}\n"
             f"作者: {album.author}\n"
+            f"热度: {album.heat_score}\n"
             f"简介: {album.intro[:180]}\n"
             f"封面: {album.cover_url or '暂无'}\n"
             f"章节预览:\n{chapter_preview}"
         )
+
+    @staticmethod
+    def _format_search_results(keyword: str, albums: list[AlbumInfo]) -> str:
+        if not albums:
+            return "未找到匹配漫画，请尝试更换关键词。"
+
+        lines = [f"搜索结果（按热度排序，关键词: {keyword}）:"]
+        for idx, album in enumerate(albums, start=1):
+            lines.append(
+                f"{idx}. [{album.album_id}] {album.title}\n"
+                f"作者: {album.author}\n"
+                f"热度: {album.heat_score}\n"
+                f"简介: {album.intro[:120]}"
+            )
+        return "\n\n".join(lines)

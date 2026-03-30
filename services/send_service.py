@@ -17,5 +17,5 @@ class SendService:
             await event.send(chain)
             return True
         except Exception as exc:
-            logger.warning(f"[qq_code_listener] 消息链文件发送失败: {exc}")
+            logger.warning(f"[JMdownload_for_Astrbot] 消息链文件发送失败: {exc}")
             return False

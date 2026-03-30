@@ -1,4 +1,4 @@
-# qq_code_listener
+# JMdownload_for_Astrbot
 
 基于 AstrBot 的 QQ 漫画监听插件（jmcomic 集成版）。
 
@@ -16,7 +16,7 @@
 ## 1. 目录结构
 
 ```text
-qq_code_listener/
+JMdownload_for_Astrbot/
   ├─ main.py
   ├─ plugin_types.py
   ├─ services/
@@ -31,7 +31,7 @@ qq_code_listener/
 
 ## 2. 安装方式
 
-1. 将 `qq_code_listener` 放入 AstrBot 插件目录（通常为 `data/plugins/`）。
+1. 将 `JMdownload_for_Astrbot` 放入 AstrBot 插件目录（通常为 `data/plugins/`）。
 2. 安装依赖：
 
 ```bash
@@ -39,7 +39,7 @@ pip install -r requirements.txt
 ```
 
 3. 重启 AstrBot 或执行插件热加载。
-4. 在插件管理中启用 `qq_code_listener`。
+4. 在插件管理中启用 `JMdownload_for_Astrbot`。
 
 ## 3. 配置项说明
 
@@ -65,8 +65,13 @@ pip install -r requirements.txt
 
 ```text
 /jmcomic 搜索 关键词
+/jmcomic 搜索 关键词 5
 /jmcomic 搜索 422866
 ```
+
+说明：
+- 当输入 `关键词 数量`（如 `saber 5`）时，会按热度排序返回前 N 条简介。
+- 数量默认 3，最大 20。
 
 2. 下载漫画（生成 PDF + ZIP 并发送）
 

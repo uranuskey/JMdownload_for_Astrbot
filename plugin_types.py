@@ -9,3 +9,4 @@ class AlbumInfo:
     author: str
     cover_url: str
     chapters: list[str]
+    heat_score: int = 0
