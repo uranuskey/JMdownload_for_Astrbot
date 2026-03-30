@@ -59,7 +59,7 @@ pip install -r requirements.txt
 
 ## 4. 指令格式
 
-以 `trigger_keywords` 包含 `/` 为例：
+注意输入如下指令前需要加上唤醒词，如唤醒词是“/”，即为//jmcomic 搜索：
 
 1. 搜索漫画
 
@@ -89,7 +89,7 @@ pip install -r requirements.txt
 ```text
 /jmcomic set maxpage 200
 /jmcomic open
-//jmcomic close
+/jmcomic close
 ```
 
 ## 5. 交互流程

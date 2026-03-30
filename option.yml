@@ -1,3 +1,0 @@
-download:
-  image:
-    suffix: .png # 该配置用于把下载的图片转为png格式
