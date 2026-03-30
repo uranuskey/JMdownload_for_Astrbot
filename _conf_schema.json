@@ -1,0 +1,72 @@
+{
+  "enabled": {
+    "description": "是否启用插件",
+    "type": "bool",
+    "default": true
+  },
+  "trigger_keywords": {
+    "description": "触发关键词前缀，仅匹配此前缀开头的消息",
+    "type": "list",
+    "default": ["/", "!", "漫画"],
+    "hint": "例如: [\"/\", \"!\", \"漫画\"]"
+  },
+  "allowed_group_ids": {
+    "description": "允许使用功能的群聊 ID 白名单",
+    "type": "list",
+    "default": [],
+    "hint": "留空表示不限制群聊；有值时仅白名单群可使用"
+  },
+  "allowed_user_ids": {
+    "description": "允许使用功能的用户 ID 白名单",
+    "type": "list",
+    "default": [],
+    "hint": "留空表示不限制用户；有值时仅白名单用户可使用"
+  },
+  "deny_reply_enabled": {
+    "description": "非白名单触发时是否回复无权限提示",
+    "type": "bool",
+    "default": false
+  },
+  "deny_reply_text": {
+    "description": "无权限提示内容",
+    "type": "string",
+    "default": "你没有权限使用该功能。"
+  },
+  "download_root": {
+    "description": "下载与中间文件目录",
+    "type": "string",
+    "default": "data/qq_code_listener",
+    "hint": "建议使用 AstrBot 可写目录"
+  },
+  "search_result_limit": {
+    "description": "关键词搜索时最多读取结果数量",
+    "type": "int",
+    "default": 3
+  },
+  "zip_level": {
+    "description": "ZIP 压缩等级，范围 0-9",
+    "type": "int",
+    "default": 9
+  },
+  "zip_password": {
+    "description": "ZIP 压缩密码（加密压缩必填）",
+    "type": "string",
+    "default": "123456"
+  },
+  "default_max_page": {
+    "description": "默认最大下载页数（可被管理员命令覆盖）",
+    "type": "int",
+    "default": 200
+  },
+  "retry_per_chapter": {
+    "description": "每章节下载重试次数",
+    "type": "int",
+    "default": 3
+  },
+  "admin_user_ids": {
+    "description": "管理员 QQ 号列表（用于 /set 与 /jmcomic 命令）",
+    "type": "list",
+    "default": [],
+    "hint": "例如: [\"12345678\", \"87654321\"]"
+  }
+}
